@@ -62,7 +62,27 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # Optional RTC path if model exposes it.
+            self._sample_actions_rtc = (
+                nnx_utils.module_jit(model.sample_actions_rtc) if hasattr(model, "sample_actions_rtc") else None
+            )
             self._rng = rng or jax.random.key(0)
+
+        # Best-effort extraction of normalization stats for actions for RTC.
+        self._action_mean = None
+        self._action_std = None
+        try:
+            # output_transform is a CompositeTransform; inspect for a transform with norm_stats.
+            transforms_seq = getattr(self._output_transform, "transforms", ())
+            for t in transforms_seq:
+                norm_stats = getattr(t, "norm_stats", None)
+                if norm_stats is not None and isinstance(norm_stats, dict) and "actions" in norm_stats:
+                    self._action_mean = norm_stats["actions"].mean
+                    self._action_std = norm_stats["actions"].std
+                    break
+        except Exception:
+            # If not found, RTC will proceed without normalization.
+            pass
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -99,6 +119,47 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        return outputs
+
+    # RTC inference: calls model.sample_actions_rtc when available (JAX only).
+    def infer_rtc(self, obs: dict, *, noise: np.ndarray | None = None, **rtc_kwargs) -> dict:  # type: ignore[misc]
+        if self._is_pytorch_model:
+            raise NotImplementedError("RTC path is only implemented for JAX models.")
+
+        if getattr(self, "_sample_actions_rtc", None) is None:
+            raise AttributeError("Model does not expose sample_actions_rtc.")
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+
+        # Prepare kwargs for RTC sampling, including optional noise and normalization stats.
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            if noise.ndim == 2:
+                noise = noise[None, ...]
+            sample_kwargs["noise"] = jnp.asarray(noise)
+
+        # Attach stats if available; model will handle None safely.
+        sample_kwargs.update(
+            dict(action_mean=self._action_mean, action_std=self._action_std),
+        )
+        sample_kwargs.update(rtc_kwargs)
+
+        observation = _model.Observation.from_dict(inputs)
+        self._rng, sample_rng = jax.random.split(self._rng)
+        start_time = time.monotonic()
+        outputs = {
+            "state": inputs["state"],
+            "actions": self._sample_actions_rtc(sample_rng, observation, **sample_kwargs),
+        }
+        model_time = time.monotonic() - start_time
+
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,

@@ -277,3 +277,135 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    # RTC variant that preserves original sample_actions while enabling closed-loop biasing.
+    def sample_actions_rtc(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # RTC-specific inputs. If `previous_actions` is None, falls back to normal sampling.
+        previous_actions: at.Float[at.Array, "ah ad"] | at.Float[at.Array, "b ah ad"] | None = None,
+        weight_vector: at.Float[at.Array, "(ah*ad)"] | None = None,
+        action_mean: at.Float[at.Array, "ad"] | None = None,
+        action_std: at.Float[at.Array, "ad"] | None = None,
+        grad_mask: at.Bool[at.Array, "ad"] | at.Bool[at.Array, "(ah*ad)"] | None = None,
+    ) -> _model.Actions:
+        """RTC sampling with optional action bias correction via VJP.
+
+        Args:
+          num_steps: Number of diffusion steps to integrate over.
+          noise: Optional initial noise of shape (b, ah, ad). If None, sampled from N(0, I).
+          previous_actions: If provided, expected shape (ah, ad) or (b, ah, ad). When None, runs normal sampling.
+          weight_vector: Element-wise weights over flattened actions; defaults to zeros (no correction).
+          action_mean, action_std: Statistics to normalize `previous_actions` into model space.
+          grad_mask: If provided, either shape (ad,) broadcast over horizon or shape (ah*ad,) applied elementwise.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        # Standard diffusion discretization: t goes from 1 (noise) to 0 (data)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Prepare prefix and KV cache once.
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions_prefix = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions_prefix)
+
+        # RTC path: support batch_size == 1 to match online control use case and avoid ambiguous broadcasting.
+        if batch_size != 1:
+            raise ValueError("RTC currently supports only batch_size == 1.")
+
+        # Normalize previous actions from environment space into model space if stats are provided.
+        def _normalize_prev(prev: at.Array) -> at.Array:
+            # prev expected (b?, ah, ad)
+            if action_mean is None or action_std is None:
+                return prev
+            # Mask very small std to avoid large bias from near-constant dims.
+            safe_std = jnp.where(action_std < 1e-2, 1.0, action_std)
+            prev = (prev - action_mean) / (safe_std + 1e-6)
+            return prev
+
+        # Ensure shape (1, ah, ad)
+        if previous_actions.ndim == 2:
+            previous_actions = previous_actions[None, ...]
+        previous_actions = _normalize_prev(previous_actions)
+
+        # Prepare weighting and mask with static shapes.
+        flat_dim = self.action_horizon * self.action_dim
+        if weight_vector is None:
+            weight_vector = jnp.zeros((flat_dim,), dtype=noise.dtype)
+        else:
+            # Ensure shape (flat_dim,)
+            weight_vector = weight_vector.reshape((flat_dim,))
+
+        if grad_mask is None:
+            # Default: enable all dims.
+            grad_mask_flat = jnp.ones((flat_dim,), dtype=noise.dtype)
+        else:
+            if grad_mask.ndim == 1 and grad_mask.shape[0] == self.action_dim:
+                # Broadcast per-dim mask across horizon.
+                grad_mask_flat = jnp.repeat(grad_mask.astype(noise.dtype), self.action_horizon)
+            else:
+                grad_mask_flat = grad_mask.astype(noise.dtype).reshape((flat_dim,))
+
+        # Define vector field producing a_est_1 = x_t - t * v_t and auxiliary v_t for biasing.
+        def vector_field(x_t_flat: at.Array, time: at.Array):
+            x_t = x_t_flat.reshape((batch_size, self.action_horizon, self.action_dim))
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attend = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attend, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            a_est_1 = x_t - time * v_t
+            return a_est_1.reshape((-1,)), v_t
+
+        def step_rtc(carry):
+            x_t, time = carry
+
+            # Stability-aware scaling, following original RTC heuristic.
+            beta = 5.0
+            r_square = time**2 / (time**2 + (1.0 - time) ** 2)
+            scaling_factor = jnp.minimum(beta, time / ((1.0 - time) * r_square + 1e-8))
+
+            x_t_flat = x_t.reshape((-1,))
+
+            # VJP through a_est_1 wrt x_t_flat.
+            def vf_x(x_flat):
+                return vector_field(x_flat, time)
+
+            a_est_1_flat, vjpfun, v_t = jax.vjp(vf_x, x_t_flat, has_aux=True)
+
+            # Element-wise weighted correction target in model space.
+            target_flat = (previous_actions.reshape((-1,)) - a_est_1_flat)
+            weighted_target = target_flat * weight_vector * grad_mask_flat
+
+            bias_flat = scaling_factor * vjpfun(weighted_target)[0]
+            bias = bias_flat.reshape((batch_size, self.action_horizon, self.action_dim))
+
+            return x_t + dt * (v_t + bias), time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step_rtc, (noise, 1.0))
+        return x_0

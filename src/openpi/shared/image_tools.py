@@ -23,12 +23,14 @@ def resize_with_pad(
     if not has_batch_dim:
         images = images[None]  # type: ignore
     cur_height, cur_width = images.shape[1:3]
-    ratio = max(cur_width / width, cur_height / height)
-    resized_height = int(cur_height / ratio)
-    resized_width = int(cur_width / ratio)
-    resized_images = jax.image.resize(
-        images, (images.shape[0], resized_height, resized_width, images.shape[3]), method=method
-    )
+
+    if cur_height != height or cur_width != width:
+        ratio = max(cur_width / width, cur_height / height)
+        resized_height = int(cur_height / ratio)
+        resized_width = int(cur_width / ratio)
+        resized_images = jax.image.resize(
+            images, (images.shape[0], resized_height, resized_width, images.shape[3]), method=method
+        )
     if images.dtype == jnp.uint8:
         # round from float back to uint8
         resized_images = jnp.round(resized_images).clip(0, 255).astype(jnp.uint8)
