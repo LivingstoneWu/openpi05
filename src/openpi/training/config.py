@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.bimanual_policy as bimanual_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -453,6 +454,55 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+# COMMENT: custom DataConfig here
+@dataclasses.dataclass(frozen=True)
+class LeRobotBimanualDataConfig(DataConfigFactory):
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Boilerplate for remapping keys from the LeRobot dataset. We assume no renaming needed here.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "front_head": "front_head",
+                        "left_hand": "left_hand",
+                        "right_hand": "right_hand",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": 'prompt',
+                    }
+                )
+            ]
+        )
+
+        # These transforms are the ones we wrote earlier.
+        data_transforms = _transforms.Group(
+            inputs=[bimanual_policy.BimanualInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[bimanual_policy.BimanualOutputs()],
+        )
+
+        # Convert absolute actions to delta actions.
+        # By convention, we do not convert the gripper action (7th dimension).
+        delta_action_mask = _transforms.make_bool_mask(14, -2)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -497,14 +547,14 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 16
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 5000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -960,6 +1010,128 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+
+    # COMMENT: custom configs from here
+    #------- For Bimanual robot -------#
+    TrainConfig(
+        name="pi05_test_right",
+        # model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        # model=pi0_fast.Pi0FASTConfig(),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", max_token_len=300),
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=300),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotBimanualDataConfig(
+            # repo_id="bimanual/0513_fold_cloth",
+            repo_id="bimanual/tool_right",
+            # repo_id="bimanual/mop_desk",
+            # repo_id="bimanual/pour_water",
+            # repo_id="bimanual/pick_corn_orange",
+            # This config lets us reload the UR5 normalization stats from the base model checkpoint.
+            # Reloading normalization stats can help transfer pre-trained models to new environments.
+            # See the [norm_stats.md](../docs/norm_stats.md) file for more details.
+            assets=AssetsConfig(
+                    assets_dir="/liujinxin/code/lhc/wy/openpi/assets/pi0_bimanual_right/bimanual",
+                    # asset_id="0313_cube_red",
+                    # asset_id="0513_fold_cloth",
+                    asset_id="tool_right",
+                    # asset_id="mop_desk",
+                    #asset_id="pour_water",
+                    # asset_id="pick_corn_orange",
+                ),
+            base_config=DataConfig(
+                # local_files_only=True,  # True, if dataset is saved locally.
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        # Load the pi0 base model checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/liujinxin/zhaowei/models/openpi/jax/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora").get_freeze_filter(),),
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+    ),
+
+
+    # instructions are concatenated. 
+    TrainConfig(
+        name="pi05_right",
+        # model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        # model=pi0_fast.Pi0FASTConfig(),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", max_token_len=300),
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=300),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotBimanualDataConfig(
+            # repo_id="bimanual/0513_fold_cloth",
+            repo_id="bimanual/0925_right_hand",
+            # repo_id="bimanual/mop_desk",
+            # repo_id="bimanual/pour_water",
+            # repo_id="bimanual/pick_corn_orange",
+            # This config lets us reload the UR5 normalization stats from the base model checkpoint.
+            # Reloading normalization stats can help transfer pre-trained models to new environments.
+            # See the [norm_stats.md](../docs/norm_stats.md) file for more details.
+            assets=AssetsConfig(
+                    assets_dir="/liujinxin/code/lhc/wy/openpi/assets/pi0_0925_right_hand/bimanual",
+                    # asset_id="0313_cube_red",
+                    # asset_id="0513_fold_cloth",
+                    asset_id="0925_right_hand",
+                    # asset_id="mop_desk",
+                    #asset_id="pour_water",
+                    # asset_id="pick_corn_orange",
+                ),
+            base_config=DataConfig(
+                # local_files_only=True,  # True, if dataset is saved locally.
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        # Load the pi0 base model checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/liujinxin/zhaowei/models/openpi/jax/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora").get_freeze_filter(),),
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+    ),
+
+
+    TrainConfig(
+        name="pi05_left",
+        # model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        # model=pi0_fast.Pi0FASTConfig(),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", max_token_len=300),
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=300),
+        # model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotBimanualDataConfig(
+            # repo_id="bimanual/0513_fold_cloth",
+            repo_id="bimanual/0928_left_hand",
+            # repo_id="bimanual/mop_desk",
+            # repo_id="bimanual/pour_water",
+            # repo_id="bimanual/pick_corn_orange",
+            # This config lets us reload the UR5 normalization stats from the base model checkpoint.
+            # Reloading normalization stats can help transfer pre-trained models to new environments.
+            # See the [norm_stats.md](../docs/norm_stats.md) file for more details.
+            assets=AssetsConfig(
+                    assets_dir="/liujinxin/code/lhc/wy/openpi/assets/pi0_0928_left_hand/bimanual",
+                    # asset_id="0313_cube_red",
+                    # asset_id="0513_fold_cloth",
+                    asset_id="0928_left_hand",
+                    # asset_id="mop_desk",
+                    #asset_id="pour_water",
+                    # asset_id="pick_corn_orange",
+                ),
+            base_config=DataConfig(
+                # local_files_only=True,  # True, if dataset is saved locally.
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        # Load the pi0 base model checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/liujinxin/zhaowei/models/openpi/jax/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora").get_freeze_filter(),),
+        # freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

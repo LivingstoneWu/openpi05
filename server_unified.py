@@ -27,13 +27,14 @@ TARGET_IMG_SIZE = 334  # NOTE need to be consistent with that in calvin2json.py
 
 class LLMRobotServer:
     def __init__(self,):
-        config = _config.get_config("pi0_bimanual_tool")
+        # config = _config.get_config("pi0_bimanual_tool")
         # config = _config.get_config("pi0_bimanual_right")
         # config = _config.get_config("pi0_0826_tool_all_single_item_tasks")
+        config = _config.get_config("pi05_right")
 
-        checkpoint_dir = download.maybe_download("/liujinxin/code/lhc/openpi/checkpoints/pi0_bimanual_tool/tool_filtered_678/15000")
+        # checkpoint_dir = download.maybe_download("/liujinxin/code/lhc/openpi/checkpoints/pi0_bimanual_tool/tool_filtered_678/15000")
         # checkpoint_dir = download.maybe_download("/liujinxin/code/lhc/openpi/checkpoints/pi0_bimanual_right/tool_right/30000")
-        # checkpoint_dir = download.maybe_download("/liujinxin/code/lhc/openpi/checkpoints/pi0_0826_tool_all_single_item_tasks_new/pi0_0826_tool_all_single_item_tasks/29999")
+        checkpoint_dir = download.maybe_download("checkpoints/pi05_right/pi05_test_right/20000")
 
         # Create a trained policy.
         self.policy = _policy_config.create_trained_policy(config, checkpoint_dir)
@@ -45,7 +46,6 @@ class LLMRobotServer:
         left_img = cv2.imread("/liujinxin/code/lhc/wy/openpi/rtc_debug/left_hand_img.png")
         right_img = cv2.imread("/liujinxin/code/lhc/wy/openpi/rtc_debug/right_hand_img.png")
         state = np.load("/liujinxin/code/lhc/wy/openpi/rtc_debug/state.npy")
-        previous_actions = np.array([0])
 
         instruction = "Put the round tape on the hook"
         delay = 6
@@ -60,7 +60,6 @@ class LLMRobotServer:
             "left_hand": torch.from_numpy(left_img),
             "right_hand": torch.from_numpy(right_img),
         }
-        self.policy.infer_rtc(data, previous_actions=previous_actions, weight_vector=np.zeros(1600))
         previous_actions = np.zeros((50, 32))
         self.policy.infer_rtc(data, previous_actions=previous_actions, weight_vector=np.zeros(1600))
 
